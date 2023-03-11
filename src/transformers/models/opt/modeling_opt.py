@@ -214,10 +214,11 @@ class OPTAttention(nn.Module):
             )
 
         if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, tgt_len, src_len):
+            if attention_mask.size() not in ((bsz, 1, tgt_len, src_len), (bsz, self.num_heads, tgt_len, src_len)): # the modified size is (bsz, self.num_heads, tgt_len, src_len)
                 raise ValueError(
                     f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}, but is {attention_mask.size()}"
                 )
+            # add the attention mask for different heads
             attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + attention_mask
             attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
             attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
@@ -291,6 +292,13 @@ class OPTDecoderLayer(nn.Module):
         self.fc2 = nn.Linear(config.ffn_dim, self.embed_dim, bias=config.enable_bias)
         self.final_layer_norm = nn.LayerNorm(self.embed_dim, elementwise_affine=config.layer_norm_elementwise_affine)
 
+        self._overide_attention_mask = False
+
+    def set_overide_attention_mask(self, attention_mask_rule: callable, layer_num: int = -1):
+        self._overide_attention_mask = True
+        self.layer_num = layer_num
+        self.attention_mask_rule = attention_mask_rule
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -321,6 +329,10 @@ class OPTDecoderLayer(nn.Module):
         # 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
         if self.do_layer_norm_before:
             hidden_states = self.self_attn_layer_norm(hidden_states)
+
+        # Replace the attention mask if the rule is set
+        if self._overide_attention_mask:
+            attention_mask = self.attention_mask_rule(attention_mask, self.layer_num)
 
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
@@ -520,6 +532,8 @@ class OPTDecoder(OPTPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+        self._overide_attention_mask = False
+
     def get_input_embeddings(self):
         return self.embed_tokens
 
@@ -691,6 +705,7 @@ class OPTDecoder(OPTPreTrainedModel):
                     None,
                 )
             else:
+                # the custom attention mask for each layer
                 layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=attention_mask,
