@@ -244,6 +244,10 @@ class OPTAttention(nn.Module):
             # In order to do so, attn_weights have to be reshaped
             # twice and have to be reused in the following
             attn_weights_reshaped = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+
+            # compute the attention scores with value norm
+            attn_weights_reshaped = torch.linalg.vector_norm(value_states, dim=-1).unsqueeze(-2)*attn_weights_reshaped
+
             attn_weights = attn_weights_reshaped.view(bsz * self.num_heads, tgt_len, src_len)
         else:
             attn_weights_reshaped = None
