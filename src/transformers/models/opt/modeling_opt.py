@@ -147,8 +147,14 @@ class OPTAttention(nn.Module):
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
+        self._dynamic_attention_rule = False
+
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+    
+    def set_dynamic_attention_rule(self, attention_mask_rule: callable):
+        self._dynamic_attention_rule = True
+        self.dynamic_attention_rule = attention_mask_rule
 
     def forward(
         self,
@@ -229,6 +235,10 @@ class OPTAttention(nn.Module):
         else:
             attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
+        # use custom dynamic masking if available
+        if self._dynamic_attention_rule:
+            attn_weights = self.dynamic_attention_rule(attn_weights, attention_mask)
+
         if layer_head_mask is not None:
             if layer_head_mask.size() != (self.num_heads,):
                 raise ValueError(
@@ -293,11 +303,17 @@ class OPTDecoderLayer(nn.Module):
         self.final_layer_norm = nn.LayerNorm(self.embed_dim, elementwise_affine=config.layer_norm_elementwise_affine)
 
         self._overide_attention_mask = False
+        self._dynamic_attention_mask = False
 
     def set_overide_attention_mask(self, attention_mask_rule: callable, layer_num: int = -1):
         self._overide_attention_mask = True
         self.layer_num = layer_num
         self.attention_mask_rule = attention_mask_rule
+
+    def set_dynamic_attention_rule(self, attention_mask_rule: callable):
+        # attention_mask_rule is a function that takes in the attention weights and layer number and returns the modified
+        self._dynamic_attention_mask = True
+        self.self_attn.set_dynamic_attention_rule(attention_mask_rule)
 
     def forward(
         self,
@@ -532,7 +548,10 @@ class OPTDecoder(OPTPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+        # Use sparse attention mask to improve performance
         self._overide_attention_mask = False
+        self._dynamic_attention_mask = False
+
 
     def get_input_embeddings(self):
         return self.embed_tokens
