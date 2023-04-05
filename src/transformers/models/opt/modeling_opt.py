@@ -302,17 +302,16 @@ class OPTDecoderLayer(nn.Module):
         self.fc2 = nn.Linear(config.ffn_dim, self.embed_dim, bias=config.enable_bias)
         self.final_layer_norm = nn.LayerNorm(self.embed_dim, elementwise_affine=config.layer_norm_elementwise_affine)
 
-        self._overide_attention_mask = False
-        self._dynamic_attention_mask = False
+        self._set_static_attention_mask = False
+        self._set_dynamic_attention_mask = False
 
-    def set_overide_attention_mask(self, attention_mask_rule: callable, layer_num: int = -1):
-        self._overide_attention_mask = True
-        self.layer_num = layer_num
+    def set_static_attention_mask(self, attention_mask_rule: callable):
+        self._set_static_attention_mask = True
         self.attention_mask_rule = attention_mask_rule
 
     def set_dynamic_attention_rule(self, attention_mask_rule: callable):
         # attention_mask_rule is a function that takes in the attention weights and layer number and returns the modified
-        self._dynamic_attention_mask = True
+        self._set_dynamic_attention_mask = True
         self.self_attn.set_dynamic_attention_rule(attention_mask_rule)
 
     def forward(
@@ -347,8 +346,8 @@ class OPTDecoderLayer(nn.Module):
             hidden_states = self.self_attn_layer_norm(hidden_states)
 
         # Replace the attention mask if the rule is set
-        if self._overide_attention_mask:
-            attention_mask = self.attention_mask_rule(attention_mask, self.layer_num)
+        if self._set_static_attention_mask:
+            attention_mask = self.attention_mask_rule(attention_mask)
 
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
