@@ -235,10 +235,20 @@ class OPTAttention(nn.Module):
         else:
             attn_weights = nn.functional.softmax(attn_weights, dim=-1)
             
-        # TODO do softmax for the first N elements (N=row_index); if not, break the causual model by peeking the next worlds when the row is all masked out
-        attn_weights[attention_mask[0] == torch.tensor(torch.finfo(attention_mask.dtype).min)] = 0
-        
-        
+        # if the whole row of the attention matrix is 0, they should be manually set all the values to 0.
+        # set the value anyway now
+        # the shape of the attn_weights is (bsz * self.num_heads, tgt_len, src_len)
+        # the shape of the attention_mask is (bsz, self.num_heads or 1, tgt_len, src_len)
+        if attention_mask is not None:
+            if attention_mask.size() == (bsz, 1, tgt_len, src_len):
+                # same mask for all heads
+                attn_weights[:,attention_mask[0,0] == torch.tensor(torch.finfo(attention_mask.dtype).min)] = 0
+            elif attention_mask.size() == (bsz, self.num_heads, tgt_len, src_len):
+                attn_weights[attention_mask.view(bsz * self.num_heads, tgt_len, src_len) == torch.tensor(torch.finfo(attention_mask.dtype).min)] = 0
+            else:
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)} or {(bsz, self.num_heads, tgt_len, src_len)}, but is {attention_mask.size()}"
+                )
 
         # use custom dynamic masking if available
         if self._dynamic_attention_rule:
