@@ -228,7 +228,11 @@ class OPTAttention(nn.Module):
             attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(torch.float16)
         else:
             attn_weights = nn.functional.softmax(attn_weights, dim=-1)
-
+            
+        # TODO do softmax for the first N elements (N=row_index); if not, break the causual model by peeking the next worlds when the row is all masked out
+        attn_weights[attention_mask[0] == torch.tensor(torch.finfo(attention_mask.dtype).min)] = 0
+        
+        
         if layer_head_mask is not None:
             if layer_head_mask.size() != (self.num_heads,):
                 raise ValueError(
