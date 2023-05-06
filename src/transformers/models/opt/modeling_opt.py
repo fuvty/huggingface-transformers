@@ -242,9 +242,9 @@ class OPTAttention(nn.Module):
         if attention_mask is not None:
             if attention_mask.size() == (bsz, 1, tgt_len, src_len):
                 # same mask for all heads
-                attn_weights[:,attention_mask[0,0] == torch.tensor(torch.finfo(attention_mask.dtype).min)] = 0
+                attn_weights = attn_weights * (attention_mask[0, 0] != torch.tensor(torch.finfo(attention_mask.dtype).min))
             elif attention_mask.size() == (bsz, self.num_heads, tgt_len, src_len):
-                attn_weights[attention_mask.view(bsz * self.num_heads, tgt_len, src_len) == torch.tensor(torch.finfo(attention_mask.dtype).min)] = 0
+                attn_weights = attn_weights * (attention_mask.view(bsz * self.num_heads, tgt_len, src_len) != torch.tensor(torch.finfo(attention_mask.dtype).min))
             else:
                 raise ValueError(
                     f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)} or {(bsz, self.num_heads, tgt_len, src_len)}, but is {attention_mask.size()}"
@@ -682,6 +682,9 @@ class OPTDecoder(OPTPreTrainedModel):
             attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.bool, device=inputs_embeds.device)
         pos_embeds = self.embed_positions(attention_mask, past_key_values_length)
 
+        # if using static attention mask
+
+        # if not using static attention mask
         attention_mask = self._prepare_decoder_attention_mask(
             attention_mask, input_shape, inputs_embeds, past_key_values_length
         )
