@@ -161,7 +161,7 @@ class OPTAttention(nn.Module):
         hidden_states: torch.Tensor,
         key_value_states: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.BoolTensor] = None,
         layer_head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
@@ -222,12 +222,11 @@ class OPTAttention(nn.Module):
         if attention_mask is not None:
             if attention_mask.size() not in ((bsz, 1, tgt_len, src_len), (bsz, self.num_heads, tgt_len, src_len)): # the modified size is (bsz, self.num_heads, tgt_len, src_len)
                 raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}, but is {attention_mask.size()}"
+                    f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)} or {(bsz, self.num_heads, tgt_len, src_len)}, but is {attention_mask.size()}"
                 )
             # add the attention mask for different heads
-            attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + attention_mask
-            attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
-            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
+            dtype = attn_weights.dtype
+            attn_weights = attn_weights + (~attention_mask.view(-1, tgt_len, src_len)) * torch.tensor(torch.finfo(dtype).min, dtype=dtype, device=attn_weights.device)
 
         # upcast to fp32 if the weights are in fp16. Please see https://github.com/huggingface/transformers/pull/17437
         if attn_weights.dtype == torch.float16:
@@ -242,9 +241,9 @@ class OPTAttention(nn.Module):
         if attention_mask is not None:
             if attention_mask.size() == (bsz, 1, tgt_len, src_len):
                 # same mask for all heads
-                attn_weights = attn_weights * (attention_mask[0, 0] != torch.tensor(torch.finfo(attention_mask.dtype).min))
+                attn_weights = attn_weights * attention_mask[0, 0]
             elif attention_mask.size() == (bsz, self.num_heads, tgt_len, src_len):
-                attn_weights = attn_weights * (attention_mask.view(bsz * self.num_heads, tgt_len, src_len) != torch.tensor(torch.finfo(attention_mask.dtype).min))
+                attn_weights = attn_weights * attention_mask.view(bsz * self.num_heads, tgt_len, src_len)
             else:
                 raise ValueError(
                     f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)} or {(bsz, self.num_heads, tgt_len, src_len)}, but is {attention_mask.size()}"
@@ -362,7 +361,9 @@ class OPTDecoderLayer(nn.Module):
 
         # Replace the attention mask if the rule is set
         if self._set_static_attention_mask:
-            attention_mask = self.attention_mask_rule(attention_mask)
+            # attention mask expand shape from (bsz, 1, seq, seq) to (bdz, head, seq, seq)
+            attention_mask: torch.BoolTensor = self.attention_mask_rule(attention_mask)
+            
 
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
@@ -688,6 +689,9 @@ class OPTDecoder(OPTPreTrainedModel):
         attention_mask = self._prepare_decoder_attention_mask(
             attention_mask, input_shape, inputs_embeds, past_key_values_length
         )
+        # convert attention_mask to binary tensor
+        if attention_mask.dtype != torch.bool:
+            attention_mask = (attention_mask != (torch.finfo(attention_mask.dtype).min))        
 
         if self.project_in is not None:
             inputs_embeds = self.project_in(inputs_embeds)
