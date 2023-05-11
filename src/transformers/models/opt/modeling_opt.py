@@ -226,7 +226,9 @@ class OPTAttention(nn.Module):
                 )
             # add the attention mask for different heads
             dtype = attn_weights.dtype
-            attn_weights = attn_weights + (~attention_mask.view(-1, tgt_len, src_len)) * torch.tensor(torch.finfo(dtype).min, dtype=dtype, device=attn_weights.device)
+            attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + (~attention_mask.view(-1, tgt_len, src_len)) * torch.tensor(torch.finfo(dtype).min, dtype=dtype, device=attn_weights.device)
+            attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min)).view(bsz * self.num_heads, tgt_len, src_len)
+            
 
         # upcast to fp32 if the weights are in fp16. Please see https://github.com/huggingface/transformers/pull/17437
         if attn_weights.dtype == torch.float16:
