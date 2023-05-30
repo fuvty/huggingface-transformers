@@ -38,6 +38,13 @@ from ...utils import (
 )
 from .configuration_opt import OPTConfig
 
+import xformers.components.attention.attention_patterns as AP
+from xformers.components.attention.core import scaled_dot_product_attention
+from xformers.components.attention._sputnik_sparse import SparseCS
+
+import os
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
 
 logger = logging.get_logger(__name__)
 
@@ -127,6 +134,7 @@ class OPTAttention(nn.Module):
         dropout: float = 0.0,
         is_decoder: bool = False,
         bias: bool = True,
+        is_xformers: bool = True,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -148,6 +156,7 @@ class OPTAttention(nn.Module):
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
         self._dynamic_attention_rule = False
+        self.is_xformers = is_xformers
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -211,72 +220,88 @@ class OPTAttention(nn.Module):
         value_states = value_states.view(*proj_shape)
 
         src_len = key_states.size(1)
-        attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
 
-        if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz * self.num_heads, tgt_len, src_len)}, but is"
-                f" {attn_weights.size()}"
-            )
+        if(output_attentions or ~self.is_xformers):
+            attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
 
-        if attention_mask is not None:
-            if attention_mask.size() not in ((bsz, 1, tgt_len, src_len), (bsz, self.num_heads, tgt_len, src_len)): # the modified size is (bsz, self.num_heads, tgt_len, src_len)
+            if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
                 raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)} or {(bsz, self.num_heads, tgt_len, src_len)}, but is {attention_mask.size()}"
+                    f"Attention weights should be of size {(bsz * self.num_heads, tgt_len, src_len)}, but is"
+                    f" {attn_weights.size()}"
                 )
-            # add the attention mask for different heads
-            dtype = attn_weights.dtype
-            attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + (~attention_mask.view(-1, tgt_len, src_len)) * torch.tensor(torch.finfo(dtype).min, dtype=dtype, device=attn_weights.device)
-            attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min)).view(bsz * self.num_heads, tgt_len, src_len)
-            
 
-        # upcast to fp32 if the weights are in fp16. Please see https://github.com/huggingface/transformers/pull/17437
-        if attn_weights.dtype == torch.float16:
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(torch.float16)
-        else:
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1)
-            
-        # if the whole row of the attention matrix is 0, they should be manually set all the values to 0.
-        # set the value anyway now
-        # the shape of the attn_weights is (bsz * self.num_heads, tgt_len, src_len)
-        # the shape of the attention_mask is (bsz, self.num_heads or 1, tgt_len, src_len)
-        if attention_mask is not None:
-            if attention_mask.size() == (bsz, 1, tgt_len, src_len):
-                # same mask for all heads
-                attn_weights = attn_weights * attention_mask[0, 0]
-            elif attention_mask.size() == (bsz, self.num_heads, tgt_len, src_len):
-                attn_weights = attn_weights * attention_mask.view(bsz * self.num_heads, tgt_len, src_len)
+            if attention_mask is not None:
+                if attention_mask.size() not in ((bsz, 1, tgt_len, src_len), (bsz, self.num_heads, tgt_len, src_len)): # the modified size is (bsz, self.num_heads, tgt_len, src_len)
+                    raise ValueError(
+                        f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)} or {(bsz, self.num_heads, tgt_len, src_len)}, but is {attention_mask.size()}"
+                    )
+                # add the attention mask for different heads
+                dtype = attn_weights.dtype
+                attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + (~attention_mask.view(-1, tgt_len, src_len)) * torch.tensor(torch.finfo(dtype).min, dtype=dtype, device=attn_weights.device)
+                attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min)).view(bsz * self.num_heads, tgt_len, src_len)
+                
+
+            # upcast to fp32 if the weights are in fp16. Please see https://github.com/huggingface/transformers/pull/17437
+            if attn_weights.dtype == torch.float16:
+                attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(torch.float16)
             else:
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)} or {(bsz, self.num_heads, tgt_len, src_len)}, but is {attention_mask.size()}"
-                )
+                attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+                
+            # if the whole row of the attention matrix is 0, they should be manually set all the values to 0.
+            # set the value anyway now
+            # the shape of the attn_weights is (bsz * self.num_heads, tgt_len, src_len)
+            # the shape of the attention_mask is (bsz, self.num_heads or 1, tgt_len, src_len)
+            if attention_mask is not None:
+                if attention_mask.size() == (bsz, 1, tgt_len, src_len):
+                    # same mask for all heads
+                    attn_weights = attn_weights * attention_mask[0, 0]
+                elif attention_mask.size() == (bsz, self.num_heads, tgt_len, src_len):
+                    attn_weights = attn_weights * attention_mask.view(bsz * self.num_heads, tgt_len, src_len)
+                else:
+                    raise ValueError(
+                        f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)} or {(bsz, self.num_heads, tgt_len, src_len)}, but is {attention_mask.size()}"
+                    )
 
-        # use custom dynamic masking if available
-        if self._dynamic_attention_rule:
-            attn_weights = self.dynamic_attention_rule(attn_weights, attention_mask)
+            # use custom dynamic masking if available
+            if self._dynamic_attention_rule:
+                attn_weights = self.dynamic_attention_rule(attn_weights, attention_mask)
 
-        if layer_head_mask is not None:
-            if layer_head_mask.size() != (self.num_heads,):
-                raise ValueError(
-                    f"Head mask for a single layer should be of size {(self.num_heads,)}, but is"
-                    f" {layer_head_mask.size()}"
-                )
-            attn_weights = layer_head_mask.view(1, -1, 1, 1) * attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
-            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
+            if layer_head_mask is not None:
+                if layer_head_mask.size() != (self.num_heads,):
+                    raise ValueError(
+                        f"Head mask for a single layer should be of size {(self.num_heads,)}, but is"
+                        f" {layer_head_mask.size()}"
+                    )
+                attn_weights = layer_head_mask.view(1, -1, 1, 1) * attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+                attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
-        if output_attentions:
-            # this operation is a bit awkward, but it's required to
-            # make sure that attn_weights keeps its gradient.
-            # In order to do so, attn_weights have to be reshaped
-            # twice and have to be reused in the following
-            attn_weights_reshaped = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
-            attn_weights = attn_weights_reshaped.view(bsz * self.num_heads, tgt_len, src_len)
-        else:
+                attn_weights_reshaped = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+            
+            if ~self.is_xformers:
+                attn_probs = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
+                attn_output = torch.bmm(attn_probs, value_states)
+            
+            '''if output_attentions:
+                # this operation is a bit awkward, but it's required to
+                # make sure that attn_weights keeps its gradient.
+                # In order to do so, attn_weights have to be reshaped
+                # twice and have to be reused in the following
+                attn_weights_reshaped = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+                attn_weights = attn_weights_reshaped.view(bsz * self.num_heads, tgt_len, src_len)
+            else:
+                attn_weights_reshaped = None'''
+
+        
+        if self.is_xformers:
+            attention_mask = attention_mask.squeeze(0)
+            attention_mask = torch.masked_fill(torch.zeros(attention_mask.shape, device=attention_mask.device), ~attention_mask, float("-inf"))
+        
+            attn_output = scaled_dot_product_attention(query_states, key_states, value_states, attention_mask, dropout=torch.nn.Dropout(self.dropout))
+
+            attn_output = torch.squeeze(attn_output, 0)
+
+        if ~output_attentions:
             attn_weights_reshaped = None
-
-        attn_probs = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
-
-        attn_output = torch.bmm(attn_probs, value_states)
 
         if attn_output.size() != (bsz * self.num_heads, tgt_len, self.head_dim):
             raise ValueError(
