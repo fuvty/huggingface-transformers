@@ -40,7 +40,60 @@ from .configuration_opt import OPTConfig
 
 from triton.ops.blocksparse import matmul as blocksparse_matmul  # type: ignore
 from triton.ops.blocksparse import softmax as blocksparse_softmax  # type: ignore
-from xformers.components.attention.attention_patterns import pattern_to_layout
+
+def pattern_to_layout(mask: torch.Tensor, block_size: int) -> torch.Tensor:
+    r"""
+    <from xformers>
+    Given a mask pattern and blocksize, return the corresponding layout
+    which makes sure that all the positives in the mask are covered
+    """
+    assert mask.ndim >= 2, "We're expecting [Heads, Seq, Seq] or [Seq, Seq]"
+    _should_squeeze = False
+
+    if mask.ndim == 2:
+        mask = mask.unsqueeze(0)
+        _should_squeeze = True
+
+    assert (
+        mask.shape[1] % block_size == 0 and mask.shape[2] % block_size == 0
+    ), "We're only handling masks divisible by block_size"
+
+    # Now mark the mask
+    layout = torch.nn.functional.max_pool2d(
+        mask.to(torch.float), kernel_size=block_size, stride=block_size
+    )
+    layout = layout.to(torch.long)
+
+    if _should_squeeze:
+        layout.squeeze_(0)
+
+    return layout
+
+def block_sparse_to_dense(sparse_matrix, layout, batch_size, num_heads, token_length, block_size):
+    '''
+    sparse_matrix: shape: (batch_size, num_non_zero_blocks, block_size, block_size)
+    layout: shape: (num_heads, num_blocks, num_blocks)
+    '''
+    precision = sparse_matrix.dtype
+    device = sparse_matrix.device
+
+    layout_flatten = layout.reshape(-1) # shape: (num_heads * num_blocks * num_blocks)
+    num_blocks = layout.shape[1]
+    # insert zero matrix to sparse matrix
+    num_non_zero_blocks = sparse_matrix.shape[1]
+    block_fill_index = torch.cumsum(layout_flatten, dim=0) - 1 # shape: (num_heads * num_blocks * num_blocks)
+    block_fill_index[layout_flatten==0] = num_non_zero_blocks
+    zero_block = torch.zeros((batch_size, 1, block_size, block_size), dtype=precision, device=device)
+    # fill in the zero blocks into the sparse matrix based on the layout
+    unfold_dense_matrix = torch.cat([sparse_matrix, zero_block], dim=1) # shape: (batch_size, num_non_zero_blocks + num_zero_blocks, block_size, block_size)
+    dense_matrix = unfold_dense_matrix[:, block_fill_index] # shape: (batch_size, num_heads * num_blocks * num_blocks, block_size, block_size)
+
+    # reshape the dense matrix to the dense attention weights
+    dense_matrix = dense_matrix.view(batch_size, num_heads, num_blocks, num_blocks, block_size, block_size)
+    dense_matrix = dense_matrix.permute(0, 1, 2, 4, 3, 5) # shape: (batch_size, num_heads, block_size, num_blocks, block_size, num_blocks)
+    dense_matrix = dense_matrix.reshape(batch_size, num_heads, token_length, token_length) # shape: (batch_size, num_heads, token_length, token_length)
+
+    return dense_matrix
 
 logger = logging.get_logger(__name__)
 
@@ -150,7 +203,10 @@ class OPTAttention(nn.Module):
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
         self._dynamic_attention_rule = False
-        self._sparse_implementation = False
+        self._sparse_block_size = 64
+
+        self._sparse_implementation = True
+        self._debug = False
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -245,23 +301,38 @@ class OPTAttention(nn.Module):
         key_states = key_states.view(*proj_shape)
         value_states = value_states.view(*proj_shape)
 
-        src_len = key_states.size(1)
+        src_len = key_states.size(-2)
 
         # use dense or sparse attention mask
         if self._sparse_implementation:
-            block_size = 64 # noqa
             # layout is a max_pooling of the attention mask by the block_size
-            # attention_mask is of shape [bsz, head, tgt_len, src_len]
-            # layout = torch.nn.functional.max_pool2d(attention_mask.to(torch.float32), (block_size, block_size)).squeeze(0).to(int)
-            layout = pattern_to_layout(attention_mask[0], block_size)
+            # attention_mask is of shape [bsz, head, tgt_len, src_len] or [bsz, -1, tgt_len, src_len]
+            layout = pattern_to_layout(attention_mask[0], self._sparse_block_size)
+            if layout.size(0) == 1:
+                layout = layout.expand(self.num_heads, -1, -1)
             if not hasattr(self, "sparse_dot_sdd"):
-                self.create_triton_kernels(layout, block_size, hidden_states.device)
+                self.create_triton_kernels(layout, self._sparse_block_size, hidden_states.device)
             # reshape 
             attn_weights = self.sparse_dot_sdd(query_states, key_states)
+
+            # convert to dense
+            if self._debug:
+                attn_weights = block_sparse_to_dense(attn_weights, layout, bsz, self.num_heads, tgt_len, self._sparse_block_size).reshape(bsz * self.num_heads, tgt_len, src_len)
+
+                value_states = value_states.view(bsz * self.num_heads, -1, self.head_dim)
+                
+                #######debug########
+                proj_shape_dense = (bsz * self.num_heads, -1, self.head_dim)
+                query_states_dense = query_states.view(*proj_shape_dense)
+                key_states_dense = key_states.view(*proj_shape_dense)
+                value_states_dense = value_states.view(*proj_shape_dense)
+                attn_weights_dense = torch.bmm(query_states_dense, key_states_dense.transpose(1, 2))
+                #######end debug########
 
         else:
             attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
 
+        if (not self._sparse_implementation) or self._debug:
             if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
                 raise ValueError(
                     f"Attention weights should be of size {(bsz * self.num_heads, tgt_len, src_len)}, but is"
@@ -275,9 +346,36 @@ class OPTAttention(nn.Module):
                     )
                 # add the attention mask for different heads
                 dtype = attn_weights.dtype
-                attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + (~attention_mask.view(bsz, -1, tgt_len, src_len)) * torch.tensor(torch.finfo(dtype).min, dtype=dtype, device=attn_weights.device)
+                attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + (~attention_mask.view(bsz, -1, tgt_len, src_len)) * torch.tensor(torch.finfo(dtype).min, dtype=dtype, device=attn_weights.device) if (not self._debug) else (attention_mask.view(bsz, -1, tgt_len, src_len))*attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + (~attention_mask.view(bsz, -1, tgt_len, src_len)) * torch.tensor(torch.finfo(dtype).min, dtype=dtype, device=attn_weights.device)
                 attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min)).view(bsz * self.num_heads, tgt_len, src_len)
-                
+
+        if self._sparse_implementation and self._debug:
+            ########debug########
+            dtype = attn_weights_dense.dtype
+            attn_weights_dense = (attention_mask.view(bsz, -1, tgt_len, src_len))*attn_weights_dense.view(bsz, self.num_heads, tgt_len, src_len) + (~attention_mask.view(bsz, -1, tgt_len, src_len)) * torch.tensor(torch.finfo(dtype).min, dtype=dtype, device=attn_weights_dense.device)
+            attn_weights_dense = torch.max(attn_weights_dense, torch.tensor(torch.finfo(attn_weights_dense.dtype).min)).view(bsz * self.num_heads, tgt_len, src_len)
+
+            attn_weights_res = torch.abs(attn_weights_dense - attn_weights)
+            if not torch.allclose(attn_weights, attn_weights_dense, atol=1e-5):
+                print("replace attn_weights with attn_weights_dense")
+                attn_weights = attn_weights_dense
+            else:
+                print("keep attn_weights")
+
+            # import matplotlib.pyplot as plt
+            # import numpy as np
+            # head = -3
+            # fig, ax = plt.subplots(1, 3, figsize=(15, 5))
+            # ax[0].imshow(attn_weights_res[head].detach().cpu().numpy())
+            # ax[0].set_title("res")
+            # ax[1].imshow(attn_weights_dense[head].detach().cpu().numpy())
+            # ax[1].set_title("mask")
+            # ax[2].imshow(attn_weights[head].detach().cpu().numpy())
+            # ax[2].set_title("sparse to dense")
+            # plt.savefig("attn_weights.png")
+            
+            ########end debug########
+
         if self._sparse_implementation:
             assert(layer_head_mask is None), "Sparse attention does not support layer_head_mask"
             assert(not self._dynamic_attention_rule), "Sparse attention does not support dynamic attention rule"
@@ -285,7 +383,10 @@ class OPTAttention(nn.Module):
             attn_weights_reshaped = None
 
             # sparse softmax should automatically upcast to fp32
-            attn_weights = self.sparse_softmax(attn_weights, is_causal=True)
+            if attn_weights.dtype == torch.float16:
+                attn_weights = self.sparse_softmax(attn_weights.to(torch.float32), is_causal=True).to(torch.float16)
+            else:
+                attn_weights = self.sparse_softmax(attn_weights, is_causal=True)
                 
         else:
             # upcast to fp32 if the weights are in fp16. Please see https://github.com/huggingface/transformers/pull/17437
