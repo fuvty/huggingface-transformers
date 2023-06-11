@@ -41,34 +41,6 @@ from .configuration_opt import OPTConfig
 from triton.ops.blocksparse import matmul as blocksparse_matmul  # type: ignore
 from triton.ops.blocksparse import softmax as blocksparse_softmax  # type: ignore
 
-def pattern_to_layout(mask: torch.Tensor, block_size: int) -> torch.Tensor:
-    r"""
-    <from xformers>
-    Given a mask pattern and blocksize, return the corresponding layout
-    which makes sure that all the positives in the mask are covered
-    """
-    assert mask.ndim >= 2, "We're expecting [Heads, Seq, Seq] or [Seq, Seq]"
-    _should_squeeze = False
-
-    if mask.ndim == 2:
-        mask = mask.unsqueeze(0)
-        _should_squeeze = True
-
-    assert (
-        mask.shape[1] % block_size == 0 and mask.shape[2] % block_size == 0
-    ), "We're only handling masks divisible by block_size"
-
-    # Now mark the mask
-    layout = torch.nn.functional.max_pool2d(
-        mask.to(torch.float), kernel_size=block_size, stride=block_size
-    )
-    layout = layout.to(torch.long)
-
-    if _should_squeeze:
-        layout.squeeze_(0)
-
-    return layout
-
 def block_sparse_to_dense(sparse_matrix, layout, batch_size, num_heads, token_length, block_size):
     '''
     sparse_matrix: shape: (batch_size, num_non_zero_blocks, block_size, block_size)
@@ -202,10 +174,12 @@ class OPTAttention(nn.Module):
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
-        self._dynamic_attention_rule = False
-        self._sparse_block_size = 64
+        self._static_sparse_layout = None
 
-        self._sparse_implementation = True
+        self._dynamic_attention_rule = False
+        self._sparse_implementation = False
+
+        self._block_size = 64
         self._debug = False
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
@@ -214,6 +188,11 @@ class OPTAttention(nn.Module):
     def set_dynamic_attention_rule(self, attention_mask_rule: callable):
         self._dynamic_attention_rule = True
         self.dynamic_attention_rule = attention_mask_rule
+
+    def set_static_sparse_layout(self, layout: torch.Tensor, block_size: int = 64):
+        self._sparse_implementation = True
+        self._block_size = block_size
+        self._static_sparse_layout = layout
 
     def create_triton_kernels(self, layout, block_size, device):
         self.block_size = block_size
@@ -305,19 +284,21 @@ class OPTAttention(nn.Module):
 
         # use dense or sparse attention mask
         if self._sparse_implementation:
-            # layout is a max_pooling of the attention mask by the block_size
-            # attention_mask is of shape [bsz, head, tgt_len, src_len] or [bsz, -1, tgt_len, src_len]
-            layout = pattern_to_layout(attention_mask[0], self._sparse_block_size)
+            if self._static_sparse_layout is None:
+                raise NotImplementedError("static_sparse_layout must be set for sparse attention, on-the-fly convertion is not supported yet.")
+                layout = pattern_to_layout(attention_mask[0], self._block_size)
+            else:
+                layout = self._static_sparse_layout
             if layout.size(0) == 1:
                 layout = layout.expand(self.num_heads, -1, -1)
             if not hasattr(self, "sparse_dot_sdd"):
-                self.create_triton_kernels(layout, self._sparse_block_size, hidden_states.device)
+                self.create_triton_kernels(layout, self._block_size, hidden_states.device)
             # reshape 
             attn_weights = self.sparse_dot_sdd(query_states, key_states)
 
             # convert to dense
             if self._debug:
-                attn_weights = block_sparse_to_dense(attn_weights, layout, bsz, self.num_heads, tgt_len, self._sparse_block_size).reshape(bsz * self.num_heads, tgt_len, src_len)
+                attn_weights = block_sparse_to_dense(attn_weights, layout, bsz, self.num_heads, tgt_len, self._block_size).reshape(bsz * self.num_heads, tgt_len, src_len)
 
                 value_states = value_states.view(bsz * self.num_heads, -1, self.head_dim)
                 
@@ -482,6 +463,7 @@ class OPTDecoderLayer(nn.Module):
 
         self._set_static_attention_mask = False
         self._set_dynamic_attention_mask = False
+        self._sparse_implementation = False
 
     def set_static_attention_mask(self, attention_mask_rule: callable):
         self._set_static_attention_mask = True
@@ -491,6 +473,10 @@ class OPTDecoderLayer(nn.Module):
         # attention_mask_rule is a function that takes in the attention weights and layer number and returns the modified
         self._set_dynamic_attention_mask = True
         self.self_attn.set_dynamic_attention_rule(attention_mask_rule)
+
+    def set_static_sparse_layout(self, layout: torch.Tensor, block_size: int = 64):
+        self._sparse_implementation = True
+        self.self_attn.set_static_sparse_layout(layout, block_size)
 
     def forward(
         self,
