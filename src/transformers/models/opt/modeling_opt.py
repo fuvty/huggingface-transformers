@@ -41,6 +41,8 @@ from .configuration_opt import OPTConfig
 from triton.ops.blocksparse import matmul as blocksparse_matmul  # type: ignore
 from triton.ops.blocksparse import softmax as blocksparse_softmax  # type: ignore
 
+from flash_attn.flash_attention import FlashAttention
+
 def block_sparse_to_dense(sparse_matrix, layout, batch_size, num_heads, token_length, block_size):
     '''
     sparse_matrix: shape: (batch_size, num_non_zero_blocks, block_size, block_size)
@@ -179,6 +181,9 @@ class OPTAttention(nn.Module):
         self._dynamic_attention_rule = False
         self._sparse_implementation = False
 
+        self._flash_attn = False
+        self.flash_attention = FlashAttention(attention_dropout=self.dropout) 
+
         self._block_size = 64
         self._debug = False
 
@@ -231,17 +236,24 @@ class OPTAttention(nn.Module):
         attention_mask: Optional[torch.BoolTensor] = None,
         layer_head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
+        key_padding_mask: Optional[torch.BoolTensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
 
         # if key_value_states are provided this layer is used as a cross-attention layer
         # for the decoder
+        if self._flash_attn:
+            assert(not(self._dynamic_attention_rule or self._debug or self._sparse_implementation))
+
         is_cross_attention = key_value_states is not None
 
         bsz, tgt_len, _ = hidden_states.size()
 
         # get query proj
-        query_states = self.q_proj(hidden_states) * self.scaling
+        if not self._flash_attn:
+            query_states = self.q_proj(hidden_states) * self.scaling
+        else:
+            query_states = self.q_proj(hidden_states)
         # get key, value proj
         if is_cross_attention and past_key_value is not None:
             # reuse k,v, cross_attentions
@@ -310,10 +322,10 @@ class OPTAttention(nn.Module):
                 attn_weights_dense = torch.bmm(query_states_dense, key_states_dense.transpose(1, 2))
                 #######end debug########
 
-        else:
+        elif (not self._flash_attn) or (self._flash_attn and output_attentions):
             attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
 
-        if (not self._sparse_implementation) or self._debug:
+        if ((not self._sparse_implementation) or self._debug) and (not self._flash_attn):
             if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
                 raise ValueError(
                     f"Attention weights should be of size {(bsz * self.num_heads, tgt_len, src_len)}, but is"
@@ -369,7 +381,7 @@ class OPTAttention(nn.Module):
             else:
                 attn_weights = self.sparse_softmax(attn_weights, is_causal=True)
                 
-        else:
+        elif (not self._flash_attn) or (self._flash_attn and output_attentions):
             # upcast to fp32 if the weights are in fp16. Please see https://github.com/huggingface/transformers/pull/17437
             if attn_weights.dtype == torch.float16:
                 attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(torch.float16)
@@ -414,10 +426,24 @@ class OPTAttention(nn.Module):
             else:
                 attn_weights_reshaped = None
 
-        attn_probs = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
+        if not self._flash_attn:
+            attn_probs = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
 
         if self._sparse_implementation:
             attn_output = self.sparse_dot_dsd(attn_probs, value_states)
+        elif self._flash_attn:
+            # to change the shape of qkv, in order to meet the requirements of
+            # flash_attn, which is (batch_size, seq_length, 3, num_heads, head_dim)
+            original_shape = (bsz, self.num_heads, -1, self.head_dim)
+            q = query_states.view(*original_shape).permute(0, 2, 1, 3).unsqueeze(2)
+            k = key_states.view(*original_shape).permute(0, 2, 1, 3).unsqueeze(2)
+            v = value_states.view(*original_shape).permute(0, 2, 1, 3).unsqueeze(2)
+            qkv = torch.cat((q, k, v), dim=2)
+            # the shape of key_padding_mask is (batch_size, seq_length)
+            attn_output = self.flash_attention(qkv, key_padding_mask=key_padding_mask, causal=True)[0]
+
+            if not output_attentions:
+                attn_weights_reshaped = None
         else:
             attn_output = torch.bmm(attn_probs, value_states)
 
@@ -427,8 +453,9 @@ class OPTAttention(nn.Module):
                     f" {attn_output.size()}"
                 )
 
-        attn_output = attn_output.view(bsz, self.num_heads, tgt_len, self.head_dim)
-        attn_output = attn_output.transpose(1, 2)
+        if not self._flash_attn:
+            attn_output = attn_output.view(bsz, self.num_heads, tgt_len, self.head_dim)
+            attn_output = attn_output.transpose(1, 2)
 
         # Use the `embed_dim` from the config (stored in the class) rather than `hidden_state` because `attn_output` can be
         # partitioned aross GPUs when using tensor-parallelism.
@@ -486,6 +513,7 @@ class OPTDecoderLayer(nn.Module):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        key_padding_mask: Optional[torch.BoolTensor] = None,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
         Args:
@@ -526,6 +554,7 @@ class OPTDecoderLayer(nn.Module):
             attention_mask=attention_mask,
             layer_head_mask=layer_head_mask,
             output_attentions=output_attentions,
+            key_padding_mask=key_padding_mask,
         )
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states
@@ -837,7 +866,8 @@ class OPTDecoder(OPTPreTrainedModel):
             attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.bool, device=inputs_embeds.device)
         pos_embeds = self.embed_positions(attention_mask, past_key_values_length)
 
-        # if using static attention mask
+        # if using falsh attention, need key padding mask
+        key_padding_mask = attention_mask
 
         # if not using static attention mask
         attention_mask = self._prepare_decoder_attention_mask(
@@ -909,6 +939,7 @@ class OPTDecoder(OPTPreTrainedModel):
                     past_key_value=past_key_value,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
+                    key_padding_mask=key_padding_mask,
                 )
 
             hidden_states = layer_outputs[0]
