@@ -42,6 +42,7 @@ from triton.ops.blocksparse import matmul as blocksparse_matmul  # type: ignore
 from triton.ops.blocksparse import softmax as blocksparse_softmax  # type: ignore
 
 from flash_attn.flash_attention import FlashAttention
+from flash_attn.flash_blocksparse_attention import FlashBlocksparseAttention
 
 def block_sparse_to_dense(sparse_matrix, layout, batch_size, num_heads, token_length, block_size):
     '''
@@ -181,8 +182,10 @@ class OPTAttention(nn.Module):
         self._dynamic_attention_rule = False
         self._sparse_implementation = False
 
-        self._flash_attn = False
+        self._flash_attn = True
         self.flash_attention = FlashAttention(attention_dropout=self.dropout) 
+        #self.layout = torch.load('casual_pattern_32_32_32_32.pt')
+        #self.flash_attention = FlashBlocksparseAttention(sparsity_config=self.layout[0][0], attention_dropout=self.dropout, max_seq_length=2048)
 
         self._block_size = 64
         self._debug = False
@@ -547,6 +550,7 @@ class OPTDecoderLayer(nn.Module):
         # If in decode phase, use the normal self attention instead of the triton implementation
         _is_decode = attention_mask is not None and attention_mask.shape[-2] == 1
         self.self_attn._sparse_implementation = (not _is_decode) and self.self_attn._sparse_implementation
+        self.self_attn._flash_attn = (not _is_decode) and self.self_attn._flash_attn
 
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
