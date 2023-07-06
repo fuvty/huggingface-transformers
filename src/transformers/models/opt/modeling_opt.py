@@ -41,8 +41,7 @@ from .configuration_opt import OPTConfig
 from triton.ops.blocksparse import matmul as blocksparse_matmul  # type: ignore
 from triton.ops.blocksparse import softmax as blocksparse_softmax  # type: ignore
 
-from flash_attn.flash_attention import FlashAttention
-from flash_attn.flash_blocksparse_attention import FlashBlocksparseAttention
+
 
 def block_sparse_to_dense(sparse_matrix, layout, batch_size, num_heads, token_length, block_size):
     '''
@@ -182,12 +181,9 @@ class OPTAttention(nn.Module):
         self._dynamic_attention_rule = False
         self._sparse_implementation = False
 
-        self._flash_attn = True
-        self.flash_attention = FlashAttention(attention_dropout=self.dropout) 
-        #self.layout = torch.load('casual_pattern_32_32_32_32.pt')
-        #self.flash_attention = FlashBlocksparseAttention(sparsity_config=self.layout[0][0], attention_dropout=self.dropout, max_seq_length=2048)
+        self._flash_attn = False
+        self.flash_attention = None
 
-        self._block_size = 64
         self._debug = False
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
@@ -434,6 +430,7 @@ class OPTAttention(nn.Module):
 
         if self._sparse_implementation:
             attn_output = self.sparse_dot_dsd(attn_probs, value_states)
+
         elif self._flash_attn:
             # to change the shape of qkv, in order to meet the requirements of
             # flash_attn, which is (batch_size, seq_length, 3, num_heads, head_dim)
