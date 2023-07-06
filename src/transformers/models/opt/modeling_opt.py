@@ -184,6 +184,7 @@ class OPTAttention(nn.Module):
         self._flash_attn = False
         self.flash_attention = None
 
+        self._block_size = 64
         self._debug = False
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
