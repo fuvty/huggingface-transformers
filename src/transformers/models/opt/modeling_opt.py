@@ -41,7 +41,10 @@ from .configuration_opt import OPTConfig
 from triton.ops.blocksparse import matmul as blocksparse_matmul  # type: ignore
 from triton.ops.blocksparse import softmax as blocksparse_softmax  # type: ignore
 
+from flash_attn.flash_attention import FlashAttention
+from flash_attn.flash_blocksparse_attention import FlashBlocksparseAttention
 
+from fused_attention import _attention
 
 def block_sparse_to_dense(sparse_matrix, layout, batch_size, num_heads, token_length, block_size):
     '''
@@ -184,6 +187,9 @@ class OPTAttention(nn.Module):
         self._flash_attn = False
         self.flash_attention = None
 
+        self._flash_attn_triton = False
+        self.flash_attention_triton = None #_attention.apply
+
         self._block_size = 64
         self._debug = False
 
@@ -198,6 +204,10 @@ class OPTAttention(nn.Module):
         self._sparse_implementation = True
         self._block_size = block_size
         self._static_sparse_layout = layout
+
+    def set_flash_attention(self):
+        self._flash_attn = True
+        self.flash_attention = FlashAttention(attention_dropout=self.dropout)
 
     def create_triton_kernels(self, layout, block_size, device):
         self.block_size = block_size
@@ -243,14 +253,17 @@ class OPTAttention(nn.Module):
         # if key_value_states are provided this layer is used as a cross-attention layer
         # for the decoder
         if self._flash_attn:
-            assert(not(self._dynamic_attention_rule or self._debug or self._sparse_implementation))
+            assert(not(self._dynamic_attention_rule or self._debug or self._sparse_implementation or self._flash_attn_triton))
+
+        if self._flash_attn_triton:
+            assert(not(self._dynamic_attention_rule or self._debug or self._sparse_implementation or self._flash_attn))
 
         is_cross_attention = key_value_states is not None
 
         bsz, tgt_len, _ = hidden_states.size()
 
         # get query proj
-        if not self._flash_attn:
+        if (not self._flash_attn) and (not self._flash_attn_triton):
             query_states = self.q_proj(hidden_states) * self.scaling
         else:
             query_states = self.q_proj(hidden_states)
@@ -322,10 +335,10 @@ class OPTAttention(nn.Module):
                 attn_weights_dense = torch.bmm(query_states_dense, key_states_dense.transpose(1, 2))
                 #######end debug########
 
-        elif (not self._flash_attn) or (self._flash_attn and output_attentions):
+        elif (not (self._flash_attn or self._flash_attn_triton)) or (self._flash_attn and output_attentions) or (self._flash_attn_triton and output_attentions):
             attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
 
-        if ((not self._sparse_implementation) or self._debug) and (not self._flash_attn):
+        if ((not self._sparse_implementation) or self._debug) and (not self._flash_attn) and (not self._flash_attn_triton):
             if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
                 raise ValueError(
                     f"Attention weights should be of size {(bsz * self.num_heads, tgt_len, src_len)}, but is"
@@ -381,7 +394,7 @@ class OPTAttention(nn.Module):
             else:
                 attn_weights = self.sparse_softmax(attn_weights, is_causal=True)
                 
-        elif (not self._flash_attn) or (self._flash_attn and output_attentions):
+        elif (not (self._flash_attn or self._flash_attn_triton)) or (self._flash_attn and output_attentions) or (self._flash_attn_triton and output_attentions):
             # upcast to fp32 if the weights are in fp16. Please see https://github.com/huggingface/transformers/pull/17437
             if attn_weights.dtype == torch.float16:
                 attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(torch.float16)
@@ -426,7 +439,7 @@ class OPTAttention(nn.Module):
             else:
                 attn_weights_reshaped = None
 
-        if not self._flash_attn:
+        if not (self._flash_attn or self._flash_attn_triton):
             attn_probs = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
 
         if self._sparse_implementation:
@@ -445,6 +458,17 @@ class OPTAttention(nn.Module):
 
             if not output_attentions:
                 attn_weights_reshaped = None
+        
+        elif self._flash_attn_triton:
+            original_shape = (bsz, self.num_heads, -1, self.head_dim)
+            q = query_states.view(*original_shape)
+            k = key_states.view(*original_shape)
+            v = value_states.view(*original_shape)
+            attn_output = self.flash_attention_triton(q, k ,v, True, self.scaling).half()
+
+            if not output_attentions:
+                attn_weights_reshaped = None
+
         else:
             attn_output = torch.bmm(attn_probs, value_states)
 
@@ -454,13 +478,16 @@ class OPTAttention(nn.Module):
                     f" {attn_output.size()}"
                 )
 
-        if not self._flash_attn:
+        if not (self._flash_attn or self._flash_attn_triton):
             attn_output = attn_output.view(bsz, self.num_heads, tgt_len, self.head_dim)
             attn_output = attn_output.transpose(1, 2)
 
         # Use the `embed_dim` from the config (stored in the class) rather than `hidden_state` because `attn_output` can be
         # partitioned aross GPUs when using tensor-parallelism.
-        attn_output = attn_output.reshape(bsz, tgt_len, self.embed_dim)
+        if not self._flash_attn_triton:
+            attn_output = attn_output.reshape(bsz, tgt_len, self.embed_dim)
+        else:
+            attn_output = attn_output.transpose(1, 2).reshape(bsz, tgt_len, self.embed_dim)
 
         attn_output = self.out_proj(attn_output)
 
@@ -505,6 +532,9 @@ class OPTDecoderLayer(nn.Module):
     def set_static_sparse_layout(self, layout: torch.Tensor, block_size: int = 64):
         self._sparse_implementation = True
         self.self_attn.set_static_sparse_layout(layout, block_size)
+
+    def set_flash_attention(self):
+        self.self_attn.set_flash_attention()
 
     def forward(
         self,
