@@ -42,7 +42,10 @@ from triton.ops.blocksparse import matmul as blocksparse_matmul  # type: ignore
 from triton.ops.blocksparse import softmax as blocksparse_softmax  # type: ignore
 
 from flash_attn.flash_attention import FlashAttention
-from sparse_kernel.fused_attention import _attention
+from sparse_kernel.block_sparse_attention_prefill import sparse_attention_prefill
+from sparse_kernel.block_sparse_attention import sparse_attention_decode
+
+import time
 
 def block_sparse_to_dense(sparse_matrix, layout, batch_size, num_heads, token_length, block_size):
     '''
@@ -190,7 +193,12 @@ class OPTAttention(nn.Module):
         self.flash_attention = None
 
         self._is_flash_attn_triton = False
-        self.flash_attention_triton = None #_attention.apply
+        self.flash_attention_triton = sparse_attention_prefill
+
+        self._is_flash_attn_triton_decode = False
+        self.flash_attention_triton_decode = sparse_attention_decode
+
+        self.timer = False
 
         self._block_size = 64
         self._debug = False
@@ -264,8 +272,14 @@ class OPTAttention(nn.Module):
 
         bsz, tgt_len, _ = hidden_states.size()
 
+        if past_key_value is not None:
+            if past_key_value[0].shape[2] == 499:
+                self.timer = True
+            else:
+                self.timer = False
+
         # get query proj
-        if (not self._is_flash_attn) and (not self._is_flash_attn_triton):
+        if (not self._is_flash_attn) and (not self._is_flash_attn_triton) and (not self._is_flash_attn_triton_decode):
             query_states = self.q_proj(hidden_states) * self.scaling
         else:
             query_states = self.q_proj(hidden_states)
@@ -308,7 +322,14 @@ class OPTAttention(nn.Module):
         value_states = value_states.view(*proj_shape)
 
         src_len = key_states.size(-2)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
 
+        if self.timer:
+            #torch.cuda.synchronize()
+            #start_time = time.time()
+            start.record()
+        
         # use dense or sparse attention mask
         if self._is_sparse_implementation:
             if self._static_sparse_layout is None:
@@ -337,10 +358,10 @@ class OPTAttention(nn.Module):
                 attn_weights_dense = torch.bmm(query_states_dense, key_states_dense.transpose(1, 2))
                 #######end debug########
 
-        elif (not (self._is_flash_attn or self._is_flash_attn_triton)) or (self._is_flash_attn and output_attentions) or (self._is_flash_attn_triton and output_attentions):
+        elif (not (self._is_flash_attn or self._is_flash_attn_triton or self._is_flash_attn_triton_decode)) or (self._is_flash_attn and output_attentions) or (self._is_flash_attn_triton and output_attentions) or (self._is_flash_attn_triton_decode and output_attentions):
             attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
 
-        if ((not self._is_sparse_implementation) or self._debug) and (not self._is_flash_attn) and (not self._is_flash_attn_triton):
+        if ((not self._is_sparse_implementation) or self._debug) and (not self._is_flash_attn) and (not self._is_flash_attn_triton) and (not self._is_flash_attn_triton_decode):
             if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
                 raise ValueError(
                     f"Attention weights should be of size {(bsz * self.num_heads, tgt_len, src_len)}, but is"
@@ -396,7 +417,7 @@ class OPTAttention(nn.Module):
             else:
                 attn_weights = self.sparse_softmax(attn_weights, is_causal=True)
                 
-        elif (not (self._is_flash_attn or self._is_flash_attn_triton)) or (self._is_flash_attn and output_attentions) or (self._is_flash_attn_triton and output_attentions):
+        elif (not (self._is_flash_attn or self._is_flash_attn_triton or self._is_flash_attn_triton_decode)) or (self._is_flash_attn and output_attentions) or (self._is_flash_attn_triton and output_attentions) or (self._is_flash_attn_triton_decode and output_attentions):
             # upcast to fp32 if the weights are in fp16. Please see https://github.com/huggingface/transformers/pull/17437
             if attn_weights.dtype == torch.float16:
                 attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(torch.float16)
@@ -441,7 +462,7 @@ class OPTAttention(nn.Module):
             else:
                 attn_weights_reshaped = None
 
-        if not (self._is_flash_attn or self._is_flash_attn_triton):
+        if not (self._is_flash_attn or self._is_flash_attn_triton or self._is_flash_attn_triton_decode):
             attn_probs = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
 
         if self._is_sparse_implementation:
@@ -466,7 +487,34 @@ class OPTAttention(nn.Module):
             q = query_states.view(*original_shape)
             k = key_states.view(*original_shape)
             v = value_states.view(*original_shape)
-            attn_output = self.flash_attention_triton(q, k ,v, True, self.scaling).half()
+            # lut: (bsz, self.num_heads, seq_len/BLOCK_M, nnz)
+            # give any lut you want here, but each row should have a valid block
+            nnz = 5
+            lut = torch.tensor([0,1,2,3,4], device=q.device).view(1, nnz)
+            lut = lut.expand(1, 32, 64, nnz).contiguous()
+            attn_output = self.flash_attention_triton(q, k ,v, True, self.scaling, lut, 64, 64).half()
+
+            if not output_attentions:
+                attn_weights_reshaped = None
+
+        elif self._is_flash_attn_triton_decode:
+            original_shape = (bsz, self.num_heads, -1, self.head_dim)
+            q = query_states.view(*original_shape)
+            k = key_states.view(*original_shape)
+            v = value_states.view(*original_shape)
+            # nnz = 3
+            # lut = torch.tensor([i for i in range(nnz)], device=q.device).view(1, nnz)
+            # lut = lut.expand(3, 32, nnz).contiguous()
+            lut = torch.load('test_lut.pt').to(q.device)
+            # if self.timer:
+            #     torch.cuda.synchronize()
+            #     start_time = time.time()
+            attn_output = self.flash_attention_triton_decode(q, k ,v, self.scaling, lut, 64).half()
+            # if self.timer:
+            #     torch.cuda.synchronize()
+            #     end_time = time.time()
+            #     with open('mean_deocde.txt', 'a') as f:
+            #         f.write(str(end_time-start_time)+'\n')
 
             if not output_attentions:
                 attn_weights_reshaped = None
@@ -480,16 +528,23 @@ class OPTAttention(nn.Module):
                     f" {attn_output.size()}"
                 )
 
-        if not (self._is_flash_attn or self._is_flash_attn_triton):
+        if not (self._is_flash_attn or self._is_flash_attn_triton or self._is_flash_attn_triton_decode):
             attn_output = attn_output.view(bsz, self.num_heads, tgt_len, self.head_dim)
             attn_output = attn_output.transpose(1, 2)
 
         # Use the `embed_dim` from the config (stored in the class) rather than `hidden_state` because `attn_output` can be
         # partitioned aross GPUs when using tensor-parallelism.
-        if not self._is_flash_attn_triton:
+        if not (self._is_flash_attn_triton or self._is_flash_attn_triton_decode):
             attn_output = attn_output.reshape(bsz, tgt_len, self.embed_dim)
         else:
-            attn_output = attn_output.transpose(1, 2).reshape(bsz, tgt_len, self.embed_dim)
+            attn_output = attn_output.transpose(1, 2).reshape(bsz, -1, self.embed_dim)
+        
+        if self.timer:
+            #end_time = time.time()
+            end.record()
+            torch.cuda.synchronize()
+            with open('mean_deocde.txt', 'a') as f:
+                f.write(str(start.elapsed_time(end)/1000)+'\n')
 
         attn_output = self.out_proj(attn_output)
 
@@ -581,6 +636,7 @@ class OPTDecoderLayer(nn.Module):
         _is_decode = attention_mask is not None and attention_mask.shape[-2] == 1
         self.self_attn._is_sparse_implementation = (not _is_decode) and self.self_attn._is_sparse_implementation
         self.self_attn._is_flash_attn = (not _is_decode) and self.self_attn._is_flash_attn
+        #self.self_attn._is_flash_attn_triton_decode = _is_decode
 
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
@@ -606,11 +662,23 @@ class OPTDecoderLayer(nn.Module):
         if self.do_layer_norm_before:
             hidden_states = self.final_layer_norm(hidden_states)
 
+        # if past_key_value is not None:
+        #     if past_key_value[0].shape[2] == 2000:
+        #         torch.cuda.synchronize()
+        #         start_time = time.time()
+
         hidden_states = self.fc1(hidden_states)
         hidden_states = self.activation_fn(hidden_states)
 
         hidden_states = self.fc2(hidden_states)
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+
+        # if past_key_value is not None:
+        #     if past_key_value[0].shape[2] == 2000:
+        #         torch.cuda.synchronize()
+        #         end_time = time.time()
+        #         with open('mean_deocde.txt', 'a') as f:
+        #             f.write(str(end_time-start_time)+'\n')
 
         hidden_states = (residual + hidden_states).view(hidden_states_shape)
 
